@@ -87,7 +87,7 @@ def rename():
             fpath = path.price_data + market + "/" + fname
             df = pd.read_csv(fpath)
             print(df)
-            df.columns = ["index", "date","close","diff","open","high","low","volume"]
+            df.columns = ["Index","Date","Close","Diff","Open","High","Low","Volume"]
             df.to_csv(fpath)
 
 if __name__ == '__main__':
