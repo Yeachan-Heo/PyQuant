@@ -10,6 +10,18 @@ from typing import *
 from numba import jit
 from PyQuant import path, utils
 from dateutil.relativedelta import relativedelta
+random.seed(100)
+def with_seed(seed=100):
+    def wrapper(func):
+        def wrapped(*args, **kwargs):
+            random.seed(seed)
+            return func(*args, **kwargs)
+        return wrapped
+    return wrapper
+
+random.randint = with_seed()(random.randint)
+random.choice = with_seed()(random.choice)
+
 
 def NamedTimer(name):
     def wrapper(func):
@@ -40,8 +52,8 @@ class BackTestCore:
         self.seed_money = seed_money
         self.money = seed_money
         self.locked = False
-        self.df = {}
-        self.df_index = []
+        self.stock_data = {}
+        self.stock_data_index = []
         self.data_dict = {}
         self.portfolio = {}
         self.datetime_idx = None
@@ -49,17 +61,24 @@ class BackTestCore:
         self.fee, self.tax = fee, tax
 
     def __getitem__(self, item):
-        return self.df[item]
+        return self.stock_data[item]
     #
     def pv_log(self):
-        print(f"[{str(self.datetime_idx)[:10]}] pv:{self.pv}, yield:{self.pv/self.seed_money*100}%\n")
+        print(f"[{str(self.datetime_idx)[:10]}] pv:{self.pv}, yield:{(self.pv/self.seed_money-1)*100}%\n")
 
     @property
     #@NamedTimer("buyablestocks")
     def buyable_stocks(self):
         return list(filter(
-            lambda x: self.df[x].index[0] <= self.datetime_idx,
-            self.df.keys()
+            lambda x: self.stock_data[x].index[0] <= self.datetime_idx,
+            self.stock_data.keys()
+        ))
+
+    @property
+    def sellable_stocks(self):
+        return list(filter(
+            lambda x: self.portfolio[x]["amount"] > 0,
+            self.portfolio.keys()
         ))
 
     @property
@@ -82,13 +101,13 @@ class BackTestCore:
 
     def get_past_idx(self, y=0, m=0, d=0):
         try:
-            return list(self.df_index).index(self.datetime_idx - relativedelta(years=y, months=m, days=d))
+            return list(self.stock_data_index).index(self.datetime_idx - relativedelta(years=y, months=m, days=d))
         except ValueError:
             return self.get_past_idx(y, m, d+1)
 
     #@NamedTimer("maxamount")
     def max_amount(self, code):
-        if not code in self.df.keys(): raise ValueError(f"Invalid code:{code}")
+        if not code in self.stock_data.keys(): raise ValueError(f"Invalid code:{code}")
         current_price = self.current_price(code)
         amount = self.money // current_price
         while self.money - current_price*self.fee*amount < 0:
@@ -98,12 +117,12 @@ class BackTestCore:
 
     def price_at(self, code, date):
         try:
-            price = self.df[code][date].squeeze()
+            price = self.stock_data[code][date].squeeze()
             if price <= 0:
                 print(price, code, date)
             return price
         except Exception as E:
-            return self.df[code].df.loc[self.df[code].index < date]["Mid"].iloc[-1]
+            return self.stock_data[code].df.loc[self.stock_data[code].index < date]["Mid"].iloc[-1]
 
     def current_price(self, code):
         return self.price_at(code, self.datetime_idx)
@@ -111,46 +130,80 @@ class BackTestCore:
     def move_index(self, y=0, m=0, d=0):
         assert y>=0 & m>=0 & d>=0, "can't go backward"
         self.datetime_idx += relativedelta(years=y, months=m, days=d)
-        if self.datetime_idx >= self.df_index[-1]:
+        self.update_yield()
+        if self.datetime_idx >= self.stock_data_index[-1]:
             return True
-        if not self.datetime_idx in self.df_index:
+        if not self.datetime_idx in self.stock_data_index:
             return self.move_index(d=1)
         return False
 
+    def update_yield(self):
+        for key, value in self.portfolio.items():
+            cprice = self.current_price(key)
+            self.portfolio[key]["gain"] = (cprice - value["avg_price"])*value["amount"]
+            self.portfolio[key]["yield(%)"] = (cprice/value["avg_price"]-1)*100
+
     #@NamedTimer("stockio")
-    def _stock_io(self, code, amount):
-        self.money -= amount * self.current_price(code)
+    def _stock_io(self, code, cprice, amount):
+        self.money -= amount * cprice
         if not amount == 0:
-            if not code in self.portfolio.keys():
-                self.portfolio[code] = {"amount": 0, "avg_price": 0, "history":{}}
-            if amount > 0:
-                self.portfolio[code]["avg_price"] = \
-                    (
-                        self.portfolio[code]["avg_price"]*self.portfolio[code]["amount"]
-                        + self.current_price(code)*amount
-                    ) / (self.portfolio[code]["amount"] + amount)
             self.portfolio[code]["amount"] += amount
-            self.portfolio[code]["history"][str(self.datetime_idx)] = {
-                "amount": amount,
-                "price": self.current_price(code)
-            }
 
     #
     def sell(self, code, amount):
         if not code in self.portfolio.keys():
             print(f"unsellable stock :{code}")
             return
+
+        cprice = self.current_price(code)
         amount = min(self.portfolio[code]["amount"], amount)
-        self._stock_io(code, -amount)
-        self.money -= self.tax * self.current_price(code) * amount
+
+        self._stock_io(code, cprice, -amount)
+
+        tax = self.tax * cprice * amount
+        fee = (amount * cprice * self.fee)
+        self.money -= (tax+fee)
+
+        if amount > 0:
+            realized_gain = amount * (cprice - self.portfolio[code]["avg_price"])-tax-fee
+            self.portfolio[code]["realized_gain"] += realized_gain
+            self.portfolio[code]["history"][str(self.datetime_idx)] = {
+                "amount": -amount,
+                "price": cprice,
+                "realized_gain" : realized_gain,
+                "realized_yield(%)" : (realized_gain/amount/self.portfolio[code]["avg_price"])*100
+            }
+
         if self.print_log:
             print(f"sell {code} {amount}")
             self.pv_log()
 
+
     #
     def buy(self, code, amount):
+        assert amount >= 0
         amount = min(amount, self.max_amount(code))
-        self._stock_io(code, amount)
+        cprice = self.current_price(code)
+        if ((not code in self.portfolio.keys()) & (amount > 0)):
+            self.portfolio[code] = {"amount": 0, "avg_price": 0, "history": {}, "realized_gain":0}
+
+        fee = amount * cprice * self.fee
+        self.money -= fee
+
+        if amount > 0:
+            self.portfolio[code]["avg_price"] = \
+                (
+                        self.portfolio[code]["avg_price"] * self.portfolio[code]["amount"]
+                        + cprice * amount
+                ) / (self.portfolio[code]["amount"] + amount)
+
+            self.portfolio[code]["history"][str(self.datetime_idx)] = {
+                "amount": amount,
+                "price": cprice
+            }
+
+        self._stock_io(code, cprice, amount)
+
         if self.print_log:
             print(f"buy {code} {amount}")
             self.pv_log()
@@ -160,9 +213,9 @@ class BackTestCore:
         df.index = pd.DatetimeIndex(df[date_column])
         df = df.fillna(method="bfill")
         df = df.loc[df["Low"] > 0]
-        self.df[code] = StockBase(df)
-        if self.df_index.__len__() < len(df.index):
-            self.df_index = df.index
+        self.stock_data[code] = StockBase(df)
+        if self.stock_data_index.__len__() < len(df.index):
+            self.stock_data_index = df.index
         print(f"registering:{code}, {df.index[0]}~{df.index[-1]}")
 
     def register_data_code(self, code:str, **history_args):
@@ -175,7 +228,7 @@ class BackTestCore:
         self.register_data_dataframe(code, df, **kwargs)
 
     def lock(self):
-        self.datetime_idx = self.df_index[0]
+        self.datetime_idx = self.stock_data_index[0]
         self.locked = True
 
     def islocked(self):
@@ -186,23 +239,31 @@ class BackTestCore:
         self.money = self.seed_money
 
 import os
+
 if __name__ == '__main__':
-    seed_money = 1000000000
+    seed_money = 100000000
     codes = pd.read_csv(path.code_data + "kospi.csv")["code"].to_list()
-    engine = BackTestCore(seed_money)
+    engine = BackTestCore(seed_money, print_log=False)
     for p in os.listdir(path.kospi_price_data):
         engine.register_data_path(p[:-4], path.kospi_price_data + p)
     engine.lock()
-    print(engine.buyable_stocks)
-    while True:
+    engine.move_index(y=5)
+    i = 0
+    break_flag = False
+    while not break_flag:
         randombuy = random.choice(engine.buyable_stocks)
         engine.buy(randombuy, random.randint(0, engine.max_amount(randombuy)+1))
-        randomsell = random.choice(list(engine.portfolio.keys()))
-        engine.sell(randomsell, random.randint(0, engine.portfolio[randomsell]["amount"]+1))
-        if engine.move_index(d=1): break
-    print(engine.pv/seed_money*100, "% 수익!")
+        if engine.move_index(d=14): break_flag = True
+        if engine.sellable_stocks:
+            randomsell = random.choice(engine.sellable_stocks)
+            engine.sell(randomsell, random.randint(0, engine.portfolio[randomsell]["amount"]+1))
+        if i % 100 == 0:
+            pp.pprint(engine.portfolio)
+            engine.pv_log()
+        i += 1
     pp.pprint(engine.portfolio)
     json.dump(engine.portfolio, open("portfolio.json", "w"))
+    print(engine.pv / seed_money * 100-100, "% 수익!")
 
 
 
